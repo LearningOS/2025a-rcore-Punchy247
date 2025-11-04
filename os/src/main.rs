@@ -1,79 +1,277 @@
-//! The main module and entrypoint
-//!
-//! The operating system and app also starts in this module. Kernel code starts
-//! executing from `entry.asm`, after which [`rust_main()`] is called to
-//! initialize various pieces of functionality [`clear_bss()`]. (See its source code for
-//! details.)
-//!
-//! We then call [`println!`] to display `Hello, world!`.
+//! ===========================================
+//! 操作系统内核主模块 (main.rs)
+//! ===========================================
+//! 这是操作系统的入口点和核心模块
+//! 
+//! # 程序执行流程
+//! 1. CPU 启动后，首先执行 `entry.asm` 中的 `_start` 汇编代码
+//! 2. `_start` 设置栈指针，然后调用 `rust_main()` 函数
+//! 3. `rust_main()` 初始化各个模块（清理 BSS、初始化日志等）
+//! 4. 打印 "Hello, world!" 和内存布局信息
+//! 5. 正常退出 QEMU
+//! 
+//! # 内存布局
+//! 操作系统内核的内存布局由链接器脚本 `linker.ld` 定义：
+//! - .text: 代码段（可执行指令）
+//! - .rodata: 只读数据段（字符串常量等）
+//! - .data: 已初始化的数据段（全局变量）
+//! - .bss: 未初始化的数据段（需要清零）
 
-#![deny(missing_docs)]
-#![deny(warnings)]
+// ===========================================
+// 编译属性和特性标志
+// ===========================================
+
+// deny 属性：如果违反规则，编译失败（而不是警告）
+#![deny(missing_docs)]  // 要求所有公共项都有文档注释
+#![deny(warnings)]      // 将所有警告视为错误
+
+// no_std: 不使用 Rust 标准库
+// 在裸机环境中，标准库依赖操作系统支持（如内存分配、文件系统等）
+// 我们需要使用 core 库（不依赖操作系统的核心库）和自定义的实现
 #![no_std]
-#![no_main]
-#![feature(panic_info_message)]
 
+// no_main: 不使用标准的主函数
+// 在裸机环境中，程序的入口点是汇编代码中的 _start，而不是 main 函数
+// 我们会在 _start 中调用 rust_main 函数
+#![no_main]
+
+// feature: 启用实验性功能
+#![feature(panic_info_message)]  // 允许在 panic 处理中访问详细信息
+
+// ===========================================
+// 导入和模块声明
+// ===========================================
+
+// core::arch::global_asm: 用于嵌入全局汇编代码
 use core::arch::global_asm;
+// log::*: 导入 log crate 的所有公共项（如 trace!, debug!, info! 等）
 use log::*;
 
+// #[macro_use]: 导入模块时，同时导入该模块导出的宏
+// 这使得其他模块可以直接使用 console 模块中定义的 print! 和 println! 宏
 #[macro_use]
-mod console;
-mod lang_items;
-mod logging;
-mod sbi;
+mod console;      // 控制台输出模块
+mod lang_items;   // 语言项模块（panic 处理等）
+mod logging;      // 日志系统模块
+mod sbi;          // SBI 调用封装模块
 
+// #[path = "..."]: 指定模块的文件路径
+// 通常模块名和文件名应该匹配，但这里使用 path 属性可以自定义
 #[path = "boards/qemu.rs"]
-mod board;
+mod board;  // 板级支持包（Board Support Package），包含平台特定代码
 
+// ===========================================
+// 全局汇编代码
+// ===========================================
+
+// global_asm!: 嵌入全局汇编代码
+// include_str!: 在编译时将文件内容作为字符串字面量包含进来
+// 这会将在 entry.asm 中定义的 _start 入口点包含到最终的可执行文件中
 global_asm!(include_str!("entry.asm"));
 
-/// clear BSS segment
+// ===========================================
+// BSS 段清理函数
+// ===========================================
+
+/// 清理 BSS 段（Block Started by Symbol）
+/// 
+/// # 功能说明
+/// BSS 段包含未初始化的全局变量和静态变量
+/// 根据 C/C++ 和 Rust 的规范，这些变量应该被初始化为零
+/// 
+/// # 为什么需要清理？
+/// 1. 确保未初始化的变量有确定的值（零）
+/// 2. 防止未初始化数据导致的未定义行为
+/// 3. 提供安全性（某些敏感数据应该被清零）
+/// 
+/// # 实现原理
+/// 1. 获取 BSS 段的起始地址（sbss）和结束地址（ebss）
+/// 2. 遍历整个 BSS 段，将每个字节写为 0
+/// 3. 使用 volatile 写入确保编译器不会优化掉这些写入操作
+/// 
+/// # 符号说明
+/// - sbss: BSS 段的起始地址（在 linker.ld 中定义）
+/// - ebss: BSS 段的结束地址（在 linker.ld 中定义）
+/// 
+/// # extern "C" 说明
+/// extern "C" 表示这些符号使用 C 语言的链接约定
+/// 这些符号实际上是在链接器脚本中定义的，不是实际的函数
+/// 它们只是地址，代表内存中的特定位置
 pub fn clear_bss() {
+    // extern "C" 块声明外部符号
+    // 这些符号在链接器脚本 linker.ld 中定义
     extern "C" {
-        fn sbss();
-        fn ebss();
+        fn sbss();  // BSS 段起始地址（Start of BSS）
+        fn ebss();  // BSS 段结束地址（End of BSS）
     }
-    (sbss as usize..ebss as usize).for_each(|a| unsafe { (a as *mut u8).write_volatile(0) });
+    
+    // 清理 BSS 段的核心逻辑
+    // 1. (sbss as usize..ebss as usize): 创建一个范围（Range）
+    //    - sbss 和 ebss 是函数指针，转换为 usize 得到地址值
+    //    - .. 创建半开区间 [start, end)，不包含 end
+    // 2. for_each: 对范围内的每个地址执行操作
+    //    - |a| 是闭包（Lambda）的参数，a 是地址值
+    // 3. unsafe { ... }: 裸指针操作需要 unsafe 块
+    //    - (a as *mut u8): 将地址转换为可变的 u8 指针
+    //    - write_volatile(0): 以 volatile 方式写入 0
+    //      volatile 确保写入不会被编译器优化掉，一定会执行
+    (sbss as usize..ebss as usize).for_each(|a| {
+        unsafe {
+            // 将地址转换为可变指针，然后写入 0
+            (a as *mut u8).write_volatile(0)
+        }
+    });
 }
 
-/// the rust entry-point of os
+// ===========================================
+// Rust 主入口函数
+// ===========================================
+
+/// Rust 代码的入口点
+/// 
+/// # 函数属性说明
+/// `#[no_mangle]`: 防止编译器改变函数名称
+/// 在 Rust 中，编译器会改变函数名以避免冲突（名称修饰）
+/// 但我们需要从汇编代码中调用这个函数，所以必须保持原始名称
+/// 
+/// # 返回值说明
+/// `-> !` 表示这是一个发散函数，永远不会返回
+/// 这在裸机环境中是正常的，因为操作系统内核通常不会"结束"
+/// 要么无限循环，要么关闭系统
 #[no_mangle]
 pub fn rust_main() -> ! {
+    // 声明外部符号（在链接器脚本中定义）
+    // 这些符号代表各个内存段的边界地址
     extern "C" {
-        fn stext(); // begin addr of text segment
-        fn etext(); // end addr of text segment
-        fn srodata(); // start addr of Read-Only data segment
-        fn erodata(); // end addr of Read-Only data ssegment
-        fn sdata(); // start addr of data segment
-        fn edata(); // end addr of data segment
-        fn sbss(); // start addr of BSS segment
-        fn ebss(); // end addr of BSS segment
-        fn boot_stack_lower_bound(); // stack lower bound
-        fn boot_stack_top(); // stack top
+        fn stext();   // .text 段起始地址（代码段）
+        fn etext();   // .text 段结束地址
+        fn srodata(); // .rodata 段起始地址（只读数据段）
+        fn erodata(); // .rodata 段结束地址
+        fn sdata();   // .data 段起始地址（已初始化数据段）
+        fn edata();   // .data 段结束地址
+        fn sbss();    // .bss 段起始地址（未初始化数据段）
+        fn ebss();    // .bss 段结束地址
+        fn boot_stack_lower_bound(); // 启动栈的下边界（高地址）
+        fn boot_stack_top();         // 启动栈的顶部（低地址，栈从此处开始增长）
     }
+    
+    // ===========================================
+    // 初始化阶段
+    // ===========================================
+    
+    // 步骤 1: 清理 BSS 段
+    // 确保所有未初始化的全局变量和静态变量都被置为零
     clear_bss();
+    
+    // 步骤 2: 初始化日志系统
+    // 这必须在早期完成，这样后续的错误信息都能被记录
+    // logging::init() 会读取环境变量 LOG 来设置日志级别
     logging::init();
+    
+    // ===========================================
+    // 主程序执行
+    // ===========================================
+    
+    // 打印经典的 "Hello, world!" 消息
+    // println! 是我们自己实现的宏，会通过 SBI 调用输出到控制台
     println!("[kernel] Hello, world!");
+    
+    // 打印各个内存段的信息，用于调试和了解内存布局
+    // 这些信息在开发和调试时非常有用
+    
+    // trace! 宏：追踪级别的日志（最详细）
+    // {:#x} 表示以十六进制格式输出，带 0x 前缀
+    // [start, end) 表示半开区间（包含 start，不包含 end）
     trace!(
         "[kernel] .text [{:#x}, {:#x})",
-        stext as usize,
-        etext as usize
+        stext as usize,  // 代码段起始地址
+        etext as usize   // 代码段结束地址
     );
+    
+    // debug! 宏：调试级别的日志
     debug!(
         "[kernel] .rodata [{:#x}, {:#x})",
-        srodata as usize, erodata as usize
+        srodata as usize,  // 只读数据段起始地址
+        erodata as usize   // 只读数据段结束地址
     );
+    
+    // info! 宏：信息级别的日志（一般信息）
     info!(
         "[kernel] .data [{:#x}, {:#x})",
-        sdata as usize, edata as usize
+        sdata as usize,  // 数据段起始地址
+        edata as usize   // 数据段结束地址
     );
+    
+    // warn! 宏：警告级别的日志
+    // 栈的信息使用 warn 级别，因为栈的位置很重要
     warn!(
         "[kernel] boot_stack top=bottom={:#x}, lower_bound={:#x}",
-        boot_stack_top as usize, boot_stack_lower_bound as usize
+        boot_stack_top as usize,           // 栈顶（实际是最低地址）
+        boot_stack_lower_bound as usize     // 栈底（实际是最高地址）
     );
-    error!("[kernel] .bss [{:#x}, {:#x})", sbss as usize, ebss as usize);
+    
+    // error! 宏：错误级别的日志
+    // 虽然这不是错误，但我们用 error 级别来突出 BSS 段的信息
+    error!(
+        "[kernel] .bss [{:#x}, {:#x})", 
+        sbss as usize,  // BSS 段起始地址
+        ebss as usize   // BSS 段结束地址
+    );
 
+    // ===========================================
+    // 程序结束
+    // ===========================================
+    
+    // 导入 QEMUExit trait，这样才能调用 exit_success() 方法
     use crate::board::QEMUExit;
-    crate::board::QEMU_EXIT_HANDLE.exit_success(); // CI autotest success
-                                                   //crate::board::QEMU_EXIT_HANDLE.exit_failure(); // CI autoest failed
+    
+    // 正常退出 QEMU（退出码为 0，表示成功）
+    // 在 CI（持续集成）测试中，这表示自动测试通过
+    crate::board::QEMU_EXIT_HANDLE.exit_success();
+    
+    // 如果需要测试失败情况，可以取消下面的注释
+    // crate::board::QEMU_EXIT_HANDLE.exit_failure(); // CI 自动测试失败
 }
+
+// ===========================================
+// 程序执行流程总结：
+// ===========================================
+// 1. CPU 启动 → entry.asm 的 _start
+// 2. _start 设置栈指针 → 调用 rust_main()
+// 3. rust_main() 清理 BSS 段
+// 4. rust_main() 初始化日志系统
+// 5. rust_main() 打印 "Hello, world!"
+// 6. rust_main() 打印内存布局信息
+// 7. rust_main() 正常退出 QEMU
+//
+// ===========================================
+// Rust 知识补充：
+// ===========================================
+// 1. 属性（Attribute）
+//    - #![...] 是应用于整个 crate 的属性
+//    - #[...] 是应用于单个项的属性
+//    - deny/warn/allow 控制编译器的检查级别
+// 
+// 2. no_std 环境
+//    - 不能使用标准库（std）
+//    - 可以使用核心库（core）
+//    - 需要自己实现内存分配、I/O 等功能
+// 
+// 3. extern "C"
+//    - 声明外部符号（可能在汇编或链接器脚本中定义）
+//    - "C" 表示使用 C 语言的链接约定
+// 
+// 4. 裸指针（Raw Pointer）
+//    - *mut T: 可变的裸指针
+//    - *const T: 不可变的裸指针
+//    - 裸指针操作需要 unsafe 块
+//    - write_volatile 确保写入不会被优化
+// 
+// 5. 闭包（Closure）
+//    - |a| { ... } 是闭包语法
+//    - for_each 使用闭包对每个元素执行操作
+// 
+// 6. 格式化输出
+//    - {:#x} 表示十六进制格式，带 0x 前缀
+//    - {:>5} 表示右对齐，宽度 5 个字符
+//    - 更多的格式化选项可以参考 Rust 文档
